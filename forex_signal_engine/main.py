@@ -22,6 +22,7 @@ from forex_signal_engine.mt5_executor import MT5Executor
 from forex_signal_engine.notifier import TelegramNotifier
 from forex_signal_engine.filters import SignalFilter
 from forex_signal_engine.qqe_obos import QQEObOsEngine
+from forex_signal_engine.news_filter import NewsFilter, NewsAction
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
@@ -363,6 +364,7 @@ def run_live(config: Config, limits: RiskLimits | None = None):
     signal_filter = SignalFilter(min_confidence="HIGH")
     engine = SignalEngine(config, signal_filter=signal_filter)
     qqe_engine = QQEObOsEngine()
+    news_filter = NewsFilter(config.symbols)
     risk_mgr = RiskManager(config, limits)
     executor = MT5Executor(config)
     notifier = TelegramNotifier(config)
@@ -405,22 +407,39 @@ def run_live(config: Config, limits: RiskLimits | None = None):
     print(f"  Poll interval: {config.poll_interval_seconds}s")
     print("=" * 70)
     print()
+    # Fetch news calendar
+    if news_filter.refresh():
+        upcoming = news_filter.format_upcoming(hours=24)
+        print("  ---- Upcoming High-Impact News (24h) ----")
+        print(upcoming)
+        print()
+    else:
+        print("  [!] Could not fetch news calendar — trading without news filter")
+        print()
+
     print("  Bot is trading automatically. Ctrl+C to stop.")
     print()
 
-    notifier.send_message(
+    startup_msg = (
         "QMP Bot started [AUTO TRADING]\n"
         f"Account: {account.login}\n"
         f"Symbols: {', '.join(config.symbols)}\n"
         f"Risk: {lim.risk_per_trade_pct}% per trade\n"
         f"Strategy 1: QMP Trend (6-layer filter)\n"
         f"Strategy 2: QQE OB/OS (mean-reversion)\n"
+        f"News Filter: ON (FF calendar)\n"
         f"--- Risk rules ---\n"
         f"Target: {lim.profit_target_pct}% (${lim.profit_target:,.0f})\n"
         f"Max loss: {lim.max_loss_pct}% trailing\n"
         f"Daily loss: {lim.max_daily_loss_pct}%\n"
         f"Best day: {lim.best_day_rule_pct}%"
     )
+    upcoming_news = news_filter.get_upcoming(hours=12)
+    if upcoming_news:
+        startup_msg += "\n--- Upcoming News ---"
+        for e in upcoming_news[:5]:
+            startup_msg += f"\n{e.impact[0]} {e.time_utc.strftime('%H:%M UTC')} {e.country} {e.title}"
+    notifier.send_message(startup_msg)
 
     # Track positions opened by this bot (by magic number)
     known_tickets: set[int] = set()
@@ -437,6 +456,7 @@ def run_live(config: Config, limits: RiskLimits | None = None):
     total_pnl = 0.0
     closed_count = 0
     last_risk_alert: str = ""  # prevent spam — only alert when reason changes
+    last_news_alert: str = ""  # prevent news alert spam
 
     try:
         while True:
@@ -483,6 +503,53 @@ def run_live(config: Config, limits: RiskLimits | None = None):
 
             known_tickets = current_tickets
 
+            # ── 1b. News calendar: refresh + protect open trades ──
+            news_filter.refresh()
+
+            if cycle % 10 == 0:
+                be_symbols = news_filter.get_breakeven_candidates()
+                if be_symbols and positions:
+                    for p in positions:
+                        if p.magic == magic and p.symbol in be_symbols and p.profit > 0:
+                            tick = mt5.symbol_info_tick(p.symbol)
+                            if tick is None:
+                                continue
+                            current_sl = p.sl
+                            entry = p.price_open
+                            pip = 0.01 if "JPY" in p.symbol else 0.0001
+                            buffer = 3 * pip
+
+                            if p.type == 0:  # BUY
+                                new_sl = entry + buffer
+                                if current_sl < new_sl and tick.bid > new_sl:
+                                    request = {
+                                        "action": mt5.TRADE_ACTION_SLTP,
+                                        "symbol": p.symbol,
+                                        "position": p.ticket,
+                                        "sl": new_sl,
+                                        "tp": p.tp,
+                                    }
+                                    result = mt5.order_send(request)
+                                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                        alert = f"NEWS PROTECT: {p.symbol} BUY SL -> breakeven ({new_sl:.5f})"
+                                        print(f"  [{now}] {alert}")
+                                        notifier.send_message(alert)
+                            else:  # SELL
+                                new_sl = entry - buffer
+                                if current_sl > new_sl and tick.ask < new_sl:
+                                    request = {
+                                        "action": mt5.TRADE_ACTION_SLTP,
+                                        "symbol": p.symbol,
+                                        "position": p.ticket,
+                                        "sl": new_sl,
+                                        "tp": p.tp,
+                                    }
+                                    result = mt5.order_send(request)
+                                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                        alert = f"NEWS PROTECT: {p.symbol} SELL SL -> breakeven ({new_sl:.5f})"
+                                        print(f"  [{now}] {alert}")
+                                        notifier.send_message(alert)
+
             # ── 2. Check for new signals on new bars ──
             for symbol in config.symbols:
                 df = executor.get_candles(symbol, config.candle_lookback)
@@ -495,6 +562,21 @@ def run_live(config: Config, limits: RiskLimits | None = None):
                 if bar_key == last_bar_time.get(symbol):
                     continue
                 last_bar_time[symbol] = bar_key
+
+                # Check news blackout before generating signals
+                news_action, news_event = news_filter.check_symbol(symbol)
+                if news_action == NewsAction.BLOCK:
+                    news_key = f"{symbol}:{news_event.title}"
+                    if news_key != last_news_alert:
+                        msg = (
+                            f"NEWS BLOCK: {symbol} blocked — "
+                            f"{news_event.country} {news_event.title} "
+                            f"at {news_event.time_utc.strftime('%H:%M UTC')}"
+                        )
+                        print(f"  [{now}] {msg}")
+                        notifier.send_message(msg)
+                        last_news_alert = news_key
+                    continue
 
                 # Try QMP trend signal first, then QQE OB/OS
                 signal = engine.analyze(symbol, df)
@@ -600,6 +682,16 @@ def run_live(config: Config, limits: RiskLimits | None = None):
             # ── 3. Periodic status ──
             if cycle % 10 == 0:
                 account = mt5.account_info()
+                if account is None:
+                    print(f"  [{now}] Cycle {cycle} | MT5 disconnected — reconnecting...")
+                    if executor.connect():
+                        print(f"  [{now}] Reconnected to MT5")
+                        account = mt5.account_info()
+                    else:
+                        print(f"  [{now}] Reconnect failed — will retry next cycle")
+                        time.sleep(config.poll_interval_seconds)
+                        continue
+
                 risk_mgr.update_eod_equity(account.equity)
 
                 open_str = ""
@@ -632,7 +724,10 @@ def run_live(config: Config, limits: RiskLimits | None = None):
         print()
         print("-" * 70)
         account = mt5.account_info()
-        print(f"  Final equity: {account.equity:,.0f} {account.currency}")
+        if account is not None:
+            print(f"  Final equity: {account.equity:,.0f} {account.currency}")
+        else:
+            print("  Final equity: MT5 disconnected — unavailable")
         print(f"  Trades closed this session: {closed_count}")
         print(f"  Session P&L: ${total_pnl:+,.2f}")
 
